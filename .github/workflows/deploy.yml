@@ -1,15 +1,3 @@
-# Build -> test -> push Docker images to GHCR -> deploy on AWS EC2.
-#
-# Deployment method is chosen by the repository variable DEPLOY_METHOD: "ssh" (default) or "ssm".
-#
-# Required secrets
-#   ssh: EC2_HOST, EC2_USER (e.g. ec2-user / ubuntu), EC2_SSH_KEY (private key, PEM)
-#   ssm: AWS_ROLE_ARN (OIDC-assumable role with ssm:SendCommand), EC2_INSTANCE_ID
-# Optional variables
-#   AWS_REGION (default us-east-1), DEPLOY_DIR (default /opt/shardedkv)
-#
-# The EC2 instance needs Docker with the compose plugin (and the SSM agent for "ssm").
-
 name: build-and-deploy
 
 on:
@@ -20,7 +8,6 @@ on:
 permissions:
   contents: read
   packages: write
-  id-token: write # OIDC for AWS (ssm mode)
 
 concurrency:
   group: deploy-${{ github.ref }}
@@ -48,7 +35,7 @@ jobs:
           dotnet restore ShardedKvStore.sln
           dotnet build ShardedKvStore.sln -c Release --no-restore
 
-      - name: Consistent-hashing migration benchmark (fails the build if ~1/3 is not met)
+      - name: Consistent-hashing migration benchmark
         run: dotnet run --project tests/ShardingBenchmark -c Release --no-build
 
       - name: Image names
@@ -90,103 +77,96 @@ jobs:
           cache-from: type=gha,scope=shard
           cache-to: type=gha,mode=max,scope=shard
 
-  deploy-ssh:
+  deploy:
     needs: build
-    if: vars.DEPLOY_METHOD != 'ssm'
     runs-on: ubuntu-latest
-    environment: production
     env:
-      DEPLOY_DIR: ${{ vars.DEPLOY_DIR || '/opt/shardedkv' }}
+      COORDINATOR_IMAGE: ${{ needs.build.outputs.coordinator_image }}:${{ github.sha }}
+      SHARD_IMAGE: ${{ needs.build.outputs.shard_image }}:${{ github.sha }}
+      GHCR_USER: ${{ github.actor }}
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Copy docker-compose.yml to EC2
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          source: docker-compose.yml
-          target: ${{ env.DEPLOY_DIR }}
-
-      - name: Pull images and restart the cluster
+      - name: Deploy Coordinator (3.236.130.251 -> 10.0.1.16)
         uses: appleboy/ssh-action@v1.2.0
-        env:
-          COORDINATOR_IMAGE: ${{ needs.build.outputs.coordinator_image }}:${{ github.sha }}
-          SHARD_IMAGE: ${{ needs.build.outputs.shard_image }}:${{ github.sha }}
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          envs: COORDINATOR_IMAGE,SHARD_IMAGE,GHCR_USER,GHCR_TOKEN,DEPLOY_DIR
+          envs: COORDINATOR_IMAGE,GHCR_USER,GHCR_TOKEN
           script_stop: true
           script: |
             set -euo pipefail
-            cd "$DEPLOY_DIR"
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-            printf 'COORDINATOR_IMAGE=%s\nSHARD_IMAGE=%s\n' "$COORDINATOR_IMAGE" "$SHARD_IMAGE" > .env
-            docker compose pull
-            docker compose up -d --no-build --remove-orphans
+            docker pull "$COORDINATOR_IMAGE"
+            docker rm -f kv-coordinator || true
+            docker run -d --name kv-coordinator --restart unless-stopped \
+              -p 8080:8080 \
+              -v coordinator-data:/app/data \
+              -e DATA_DIR="/app/data" \
+              -e VIRTUAL_NODES="150" \
+              -e SHARD_TIMEOUT_SECONDS="10" \
+              "$COORDINATOR_IMAGE"
             docker logout ghcr.io
             docker image prune -f
-            for i in $(seq 1 30); do
+            for i in $(seq 1 25); do
               if curl -fsS http://localhost:8080/health > /dev/null; then echo "Coordinator healthy"; break; fi
               sleep 2
             done
-            curl -fsS http://localhost:8080/api/shards
 
-  deploy-ssm:
-    needs: build
-    if: vars.DEPLOY_METHOD == 'ssm'
-    runs-on: ubuntu-latest
-    environment: production
-    env:
-      DEPLOY_DIR: ${{ vars.DEPLOY_DIR || '/opt/shardedkv' }}
-      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: aws-actions/configure-aws-credentials@v4
+      - name: Deploy Shard 1 (13.220.165.95 -> 10.0.1.70)
+        uses: appleboy/ssh-action@v1.2.0
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          host: ${{ secrets.SHARD1_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: SHARD_IMAGE,GHCR_USER,GHCR_TOKEN
+          script_stop: true
+          script: |
+            set -euo pipefail
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            docker pull "$SHARD_IMAGE"
+            docker rm -f kv-shard-1 || true
+            docker run -d --name kv-shard-1 --restart unless-stopped \
+              -p 8080:8080 \
+              -v shard1-data:/app/data \
+              -e SHARD_ID="shard-1" \
+              -e SELF_URL="http://10.0.1.70:8080" \
+              -e COORDINATOR_URL="http://10.0.1.16:8080" \
+              -e PERSISTENCE_PATH="/app/data/shard-1.json" \
+              "$SHARD_IMAGE"
+            docker logout ghcr.io
+            docker image prune -f
 
-      - name: Deploy through SSM Run Command
-        env:
-          COORDINATOR_IMAGE: ${{ needs.build.outputs.coordinator_image }}:${{ github.sha }}
-          SHARD_IMAGE: ${{ needs.build.outputs.shard_image }}:${{ github.sha }}
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
-        run: |
-          set -euo pipefail
-          compose_b64=$(base64 -w0 docker-compose.yml)
-          cat > commands.json <<EOF
-          {"commands": [
-            "set -euo pipefail",
-            "mkdir -p ${DEPLOY_DIR} && cd ${DEPLOY_DIR}",
-            "echo ${compose_b64} | base64 -d > docker-compose.yml",
-            "printf 'COORDINATOR_IMAGE=%s\\nSHARD_IMAGE=%s\\n' '${COORDINATOR_IMAGE}' '${SHARD_IMAGE}' > .env",
-            "echo '${GHCR_TOKEN}' | docker login ghcr.io -u '${GHCR_USER}' --password-stdin",
-            "docker compose pull",
-            "docker compose up -d --no-build --remove-orphans",
-            "docker logout ghcr.io",
-            "docker image prune -f"
-          ]}
-          EOF
-          command_id=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --comment "shardedkv deploy ${GITHUB_SHA::7}" \
-            --parameters file://commands.json \
-            --query "Command.CommandId" --output text)
-          rm commands.json
-          echo "SSM command: $command_id"
-          aws ssm wait command-executed --command-id "$command_id" --instance-id "$INSTANCE_ID" || true
-          status=$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" --query Status --output text)
-          aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" \
-            --query "StandardOutputContent" --output text
-          echo "Status: $status"
-          test "$status" = "Success"
+      - name: Deploy Shard 2 (13.218.149.223 -> 10.0.1.47)
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SHARD2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: SHARD_IMAGE,GHCR_USER,GHCR_TOKEN
+          script_stop: true
+          script: |
+            set -euo pipefail
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            docker pull "$SHARD_IMAGE"
+            docker rm -f kv-shard-2 || true
+            docker run -d --name kv-shard-2 --restart unless-stopped \
+              -p 8080:8080 \
+              -v shard2-data:/app/data \
+              -e SHARD_ID="shard-2" \
+              -e SELF_URL="http://10.0.1.47:8080" \
+              -e COORDINATOR_URL="http://10.0.1.16:8080" \
+              -e PERSISTENCE_PATH="/app/data/shard-2.json" \
+              "$SHARD_IMAGE"
+            docker logout ghcr.io
+            docker image prune -f
+
+      - name: Verify Cluster Health & Registered Shards
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            sleep 5
+            curl -fsS http://localhost:8080/api/shards
