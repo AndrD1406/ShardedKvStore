@@ -1,0 +1,83 @@
+# Local cluster: 1 coordinator + 3 shards.
+#   docker compose up --build
+# Coordinator UI: http://localhost:8080/scalar/v1   Shards: http://localhost:8081..8083/scalar/v1
+#
+# Images can be overridden (used by the EC2 deployment):
+#   COORDINATOR_IMAGE=ghcr.io/<owner>/shardedkv-coordinator:latest SHARD_IMAGE=... docker compose up -d --no-build
+
+x-shard: &shard
+  image: ${SHARD_IMAGE:-shardedkv-shard:local}
+  build:
+    context: .
+    dockerfile: src/Shard/Dockerfile
+  restart: unless-stopped
+  depends_on:
+    - coordinator
+  networks: [kvnet]
+
+services:
+  coordinator:
+    image: ${COORDINATOR_IMAGE:-shardedkv-coordinator:local}
+    build:
+      context: .
+      dockerfile: src/Coordinator/Dockerfile
+    container_name: kv-coordinator
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /app/data
+      VIRTUAL_NODES: "150"
+      SHARD_TIMEOUT_SECONDS: "10"
+    ports:
+      - "8080:8080"
+    volumes:
+      - coordinator-data:/app/data
+    networks: [kvnet]
+
+  shard-1:
+    <<: *shard
+    container_name: kv-shard-1
+    environment:
+      SHARD_ID: shard-1
+      SELF_URL: http://shard-1:8080
+      COORDINATOR_URL: http://coordinator:8080
+      PERSISTENCE_PATH: /app/data/shard-1.json
+    ports:
+      - "8081:8080"
+    volumes:
+      - shard1-data:/app/data
+
+  shard-2:
+    <<: *shard
+    container_name: kv-shard-2
+    environment:
+      SHARD_ID: shard-2
+      SELF_URL: http://shard-2:8080
+      COORDINATOR_URL: http://coordinator:8080
+      PERSISTENCE_PATH: /app/data/shard-2.json
+    ports:
+      - "8082:8080"
+    volumes:
+      - shard2-data:/app/data
+
+  shard-3:
+    <<: *shard
+    container_name: kv-shard-3
+    environment:
+      SHARD_ID: shard-3
+      SELF_URL: http://shard-3:8080
+      COORDINATOR_URL: http://coordinator:8080
+      PERSISTENCE_PATH: /app/data/shard-3.json
+    ports:
+      - "8083:8080"
+    volumes:
+      - shard3-data:/app/data
+
+volumes:
+  coordinator-data:
+  shard1-data:
+  shard2-data:
+  shard3-data:
+
+networks:
+  kvnet:
+    driver: bridge

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json.schemastore.org/launchsettings.json",
+  "profiles": {
+    "shard-1": {
+      "commandName": "Project",
+      "launchBrowser": false,
+      "applicationUrl": "http://localhost:5001",
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "SHARD_ID": "shard-1",
+        "SELF_URL": "http://localhost:5001",
+        "COORDINATOR_URL": "http://localhost:5000",
+        "PERSISTENCE_PATH": "data/shard-1.json"
+      }
+    },
+    "shard-2": {
+      "commandName": "Project",
+      "launchBrowser": false,
+      "applicationUrl": "http://localhost:5002",
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "SHARD_ID": "shard-2",
+        "SELF_URL": "http://localhost:5002",
+        "COORDINATOR_URL": "http://localhost:5000",
+        "PERSISTENCE_PATH": "data/shard-2.json"
+      }
+    },
+    "shard-3": {
+      "commandName": "Project",
+      "launchBrowser": false,
+      "applicationUrl": "http://localhost:5003",
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "SHARD_ID": "shard-3",
+        "SELF_URL": "http://localhost:5003",
+        "COORDINATOR_URL": "http://localhost:5000",
+        "PERSISTENCE_PATH": "data/shard-3.json"
+      }
+    }
+  }
+}
