@@ -160,6 +160,30 @@ jobs:
               "$SHARD_IMAGE"
             docker logout ghcr.io
             docker image prune -f
+            
+      - name: Deploy Shard 3 (13.218.149.223 -> 10.0.1.47:8083)
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SHARD2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: SHARD_IMAGE,GHCR_USER,GHCR_TOKEN
+          script_stop: true
+          script: |
+            set -euo pipefail
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            docker pull "$SHARD_IMAGE"
+            docker rm -f kv-shard-3 || true
+            docker run -d --name kv-shard-3 --restart unless-stopped \
+              -p 8083:8080 \
+              -v shard3-data:/app/data \
+              -e SHARD_ID="shard-3" \
+              -e SELF_URL="http://10.0.1.47:8083" \
+              -e COORDINATOR_URL="http://10.0.1.16:8080" \
+              -e PERSISTENCE_PATH="/app/data/shard-3.json" \
+              "$SHARD_IMAGE"
+            docker logout ghcr.io
+            docker image prune -f
 
       - name: Verify Cluster Health & Registered Shards
         uses: appleboy/ssh-action@v1.2.0
